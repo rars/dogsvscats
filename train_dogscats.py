@@ -1,8 +1,11 @@
+#!/usr/bin/env python
+
 import numpy as np
 import os
 import bcolz
 
 from sklearn.preprocessing import OneHotEncoder
+from sklearn.utils import shuffle
 
 import utils
 reload(utils)
@@ -11,7 +14,8 @@ from utils import get_batches, get_data
 import keras
 from keras import backend as K
 from keras.models import Sequential
-from keras.layers.core import Dense
+from keras.layers.core import Dense, Flatten, Dropout
+from keras.layers.convolutional import Convolution2D, MaxPooling2D
 from keras.optimizers import RMSprop
 from keras.preprocessing import image
 
@@ -22,12 +26,18 @@ class DataProvider(object):
         self.path = path
         self.batch_size = batch_size
         
-    def get_batches(self, batch_type, batch_size=None):
+    def get_batches(
+            self,
+            batch_type,
+            gen=image.ImageDataGenerator(),
+            shuffle=False,
+            batch_size=None):
         if batch_size is None:
             batch_size = self.batch_size
         return get_batches(
             os.path.join(self.path, batch_type),
-            shuffle=False,
+            gen=gen,
+            shuffle=shuffle,
             batch_size=self.batch_size)
     
     def get_data(self, data_type):
@@ -57,20 +67,10 @@ class DataProvider(object):
         return os.path.join(self.model_path, filename)
 
 batch_size = 64
-data_provider = DataProvider('data/dogscats', batch_size)
+data_provider = DataProvider('../data/dogscats', batch_size)
 
-valid_batches = data_provider.get_batches('valid')
-train_batches = data_provider.get_batches('train')
-
-def fetch_data(data_type, filename):
-    data = data_provider.load_array(filename)
-    if data is None:
-        data = data_provider.get_data(data_type)
-        data_provider.save_array(filename, data)
-    return data
-
-# train_data = fetch_data('train', 'train_data.bc')
-# valid_data = fetch_data('valid', 'valid_data.bc')
+valid_batches = data_provider.get_batches('valid', shuffle=False)
+train_batches = data_provider.get_batches('train', shuffle=False)
 
 valid_classes = valid_batches.classes
 train_classes = train_batches.classes
@@ -90,25 +90,30 @@ print('Dropping model layer')
 model.pop()
 for layer in model.layers:
     layer.trainable = False
-model.add(Dense(2, activation='softmax'))
+# model.add(Dense(2, activation='softmax'))
 
-"""
-gen = image.ImageDataGenerator()
+def fetch_data(model, batches, filename):
+    print('Attempting to load data from {0}'.format(filename))
+    data = data_provider.load_array(filename)
+    if data is None:
+        print('Data for {0} not available'.format(filename))
+        print('Getting data for {0}'.format(filename))
+        data = model.predict_generator(batches, batches.nb_sample)
+        print('Saving data to {0}'.format(filename))
+        data_provider.save_array(filename, data)
+        print('Saved data for {0}'.format(filename))
+    return data
 
-train_batches = gen.flow(
-    train_data,
-    train_labels,
-    batch_size=batch_size,
-    shuffle=True)
+valid_features = fetch_data(model, valid_batches, 'valid_features.bc')
+train_features = fetch_data(model, train_batches, 'train_features.bc')
 
-valid_batches = gen.flow(
-    valid_data,
-    valid_labels,
-    batch_size=batch_size,
-    shuffle=False)
-"""
+train_features, train_labels = shuffle(train_features, train_labels)
 
-def fit_model(model, train_batches, valid_batches, nb_epoch=1):
+print('{0}'.format(train_features.shape))
+
+model = Sequential([Dense(2, activation='softmax', input_shape=(4096,))])
+
+def fit_model(model, train_batches, valid_batches, nb_epoch=3):
     model.fit_generator(
         train_batches,
         samples_per_epoch=train_batches.N,
@@ -121,7 +126,100 @@ print('Training last layer of model...')
 opt = RMSprop(lr=0.1)
 model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
 
-fit_model(model, train_batches, valid_batches, nb_epoch=1)
+model.fit(
+    train_features,
+    train_labels,
+    nb_epoch=8,
+    batch_size=batch_size,
+    validation_data=(valid_features, valid_labels))
+
+dense_layer = model.layers[0]
+
+vgg = Vgg16()
+model = vgg.model
+
+model.pop()
+model = Sequential([l for l in model.layers] + [dense_layer])
+
+def split_model(model):
+    layers = model.layers
+    conv_indexes = [index for index, layer in enumerate(layers) if type(layer) is Convolution2D]
+    last_conv_index = conv_indexes[-1]
+    conv_layers = layers[:last_conv_index + 1]
+    conv_model = Sequential(conv_layers)
+    dense_layers = layers[last_conv_index + 1:]
+    return conv_model, dense_layers
+
+def process_weights(layer):
+    return [o / 2.0 for o in layer.get_weights()]
+
+def get_dense_model(conv_model, dense_layers):
+    opt = RMSprop(lr = 0.00001)
+    
+    model = Sequential([
+        MaxPooling2D(input_shape=conv_model.layers[-1].output_shape[1:]),
+        Flatten(),
+        Dense(4096, activation='relu'),
+        Dropout(0.),
+        Dense(4096, activation='relu'),
+        Dropout(0.),
+        Dense(2, activation='softmax')                       
+        ])
+
+    for l1, l2 in zip(model.layers, dense_layers):
+        l1.set_weights(process_weights(l2))
+
+    model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+conv_model, dense_layers = split_model(model)
+dense_model = get_dense_model(conv_model, dense_layers)
+
+valid_features = fetch_data(conv_model, valid_batches, 'valid_conv_features.bc')
+train_features = fetch_data(conv_model, train_batches, 'train_conv_features.bc')
+
+train_labels = onehot(train_classes)
+
+train_features, train_labels = shuffle(train_features, train_labels)
+
+for layer in dense_model.layers:
+    layer.trainable = True
+
+dense_model.fit(
+    train_features,
+    train_labels,
+    nb_epoch=2,
+    batch_size=batch_size,
+    validation_data=(valid_features, valid_labels))
+
+# Data augmentation
+
+gen = image.ImageDataGenerator(
+    rotation_range=15,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    zoom_range=0.1,
+    horizontal_flip=True)
+
+train_batches = data_provider.get_batches('train', gen=gen)
+valid_batches = data_provider.get_batches('valid', shuffle=False)
+
+for layer in conv_model.layers:
+    layer.trainable = False
+
+conv_model.add(dense_model)
+
+print 'Training updated model'
+
+conv_model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
+conv_model.fit_generator(
+    train_batches,
+    samples_per_epoch=train_batches.nb_sample,
+    nb_epoch=8,
+    validation_data=valid_batches,
+    nb_val_samples=valid_batches.nb_sample)
+
+exit()
 
 print('Saving weights...')
 
@@ -145,7 +243,7 @@ enable_all_dense_layers_trainable(model)
 print('Training dense layers')
 
 K.set_value(opt.lr, 0.01)
-fit_model(model, train_batches, valid_batches, 1)
+fit_model(model, train_batches, valid_batches, nb_epoch=3)
 
 print('Saving weights...')
 
@@ -163,7 +261,7 @@ def limit_range(val, low, high):
     return val
 
 def predict_dogscats(model, data_provider, batch_size):
-    test_batches = data_provider.get_batches('test', batch_size)
+    test_batches = data_provider.get_batches('test', batch_size=batch_size)
     filename_batches = chunk(test_batches.filenames, batch_size)
 
     with open('submission.csv', 'w') as fout:
@@ -187,5 +285,5 @@ def predict_dogscats(model, data_provider, batch_size):
 print('Predicting dogscats...')
                 
 batch_size = 100
-data_provider = DataProvider('data/dogscatsredux', 100)
+data_provider = DataProvider('../data/dogscatsredux', batch_size)
 predict_dogscats(model, data_provider, batch_size)
