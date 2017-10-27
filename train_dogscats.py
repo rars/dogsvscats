@@ -16,10 +16,12 @@ from keras import backend as K
 from keras.models import Sequential
 from keras.layers.core import Dense, Flatten, Dropout
 from keras.layers.convolutional import Convolution2D, MaxPooling2D
-from keras.optimizers import RMSprop
+from keras.layers.normalization import BatchNormalization
+from keras.optimizers import RMSprop, Adam
 from keras.preprocessing import image
 
 print('Starting train_dogscats.py')
+is_training = False
 
 class DataProvider(object):
     def __init__(self, path, batch_size):
@@ -121,23 +123,25 @@ def fit_model(model, train_batches, valid_batches, nb_epoch=3):
         validation_data=valid_batches,
         nb_val_samples=valid_batches.N)
 
-print('Training last layer of model...')    
-    
-opt = RMSprop(lr=0.1)
-model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
+def train_last_layer_dense_model():
+    opt = RMSprop(lr=0.1)
+    model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
 
-model.fit(
-    train_features,
-    train_labels,
-    nb_epoch=8,
-    batch_size=batch_size,
-    validation_data=(valid_features, valid_labels))
+    model.fit(
+        train_features,
+        train_labels,
+        nb_epoch=8,
+        batch_size=batch_size,
+        validation_data=(valid_features, valid_labels))
+
+if is_training:
+    print('Training last layer of model...')    
+    train_last_layer_dense_model()
 
 dense_layer = model.layers[0]
 
 vgg = Vgg16()
 model = vgg.model
-
 model.pop()
 model = Sequential([l for l in model.layers] + [dense_layer])
 
@@ -153,6 +157,14 @@ def split_model(model):
 def process_weights(layer):
     return [o / 2.0 for o in layer.get_weights()]
 
+def process_weights2(layer, prev_p, next_p):
+    scale = (1.0 - prev_p) / (1.0 - next_p)
+    return [o * scale for o in layer.get_weights()]
+
+def copy_weights(from_layers, to_layers):
+    for to_layer, from_layer in zip(to_layers, from_layers):
+        to_layer.set_weights(from_layer.get_weights())
+
 def get_dense_model(conv_model, dense_layers):
     opt = RMSprop(lr = 0.00001)
     
@@ -166,14 +178,49 @@ def get_dense_model(conv_model, dense_layers):
         Dense(2, activation='softmax')                       
         ])
 
-    for l1, l2 in zip(model.layers, dense_layers):
-        l1.set_weights(process_weights(l2))
+    copy_weights(dense_layers, model.layers)
+
+    for layer in model.layers:
+        layer.set_weights(process_weights(layer))
 
     model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
     return model
 
+def load_dense_weights_from_vgg16bn(model):
+    from vgg16bn import Vgg16BN
+    vgg16_bn = Vgg16BN()
+    _, dense_layers = split_model(vgg16_bn.model)
+    copy_weights(dense_layers, model.layers)
+
+def get_batchnorm_model(conv_model, p):
+    model = Sequential([
+        MaxPooling2D(input_shape=conv_model.layers[-1].output_shape[1:]),
+        Flatten(),
+        Dense(4096, activation='relu'),
+        BatchNormalization(),
+        Dropout(p),
+        Dense(4096, activation='relu'),
+        BatchNormalization(),
+        Dropout(p),
+        Dense(1000, activation='softmax')
+        ])
+
+    load_dense_weights_from_vgg16bn(model)
+
+    for layer in model.layers:
+        if type(layer) == Dense:
+            layer.set_weights(process_weights2(layer, 0.5, 0.6))
+
+    model.pop()
+    for layer in model.layers:
+        layer.Trainable = False
+
+    model.add(Dense(2, activation='softmax'))
+    model.compile(optimizer=Adam(), loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
 conv_model, dense_layers = split_model(model)
-dense_model = get_dense_model(conv_model, dense_layers)
+dense_model = get_batchnorm_model(conv_model, 0.6)
 
 valid_features = fetch_data(conv_model, valid_batches, 'valid_conv_features.bc')
 train_features = fetch_data(conv_model, train_batches, 'train_conv_features.bc')
@@ -182,72 +229,91 @@ train_labels = onehot(train_classes)
 
 train_features, train_labels = shuffle(train_features, train_labels)
 
+def train_last_layer():
+    dense_model.fit(
+        train_features,
+        train_labels,
+        nb_epoch=6,
+        batch_size=batch_size,
+        validation_data=(valid_features, valid_labels))
+
+if is_training:
+    print('Train last layer of dense model with batch normalization.')
+    train_last_layer()
+    
 for layer in dense_model.layers:
     layer.trainable = True
 
-dense_model.fit(
-    train_features,
-    train_labels,
-    nb_epoch=2,
-    batch_size=batch_size,
-    validation_data=(valid_features, valid_labels))
+def train_all_dense_layers():
+    dense_model.compile(
+        optimizer=Adam(lr=0.00001),
+        loss='categorical_crossentropy',
+        metrics=['accuracy'])
 
-# Data augmentation
+    dense_model.fit(
+        train_features,
+        train_labels,
+        nb_epoch=12,
+        batch_size=batch_size,
+        validation_data=(valid_features, valid_labels))
 
-gen = image.ImageDataGenerator(
-    rotation_range=15,
-    width_shift_range=0.1,
-    height_shift_range=0.1,
-    zoom_range=0.1,
-    horizontal_flip=True)
+if is_training:
+    print('Train dense layers of model with batch normalization.')
+    train_all_dense_layers()
 
-train_batches = data_provider.get_batches('train', gen=gen)
-valid_batches = data_provider.get_batches('valid', shuffle=False)
-
+# Join models
 for layer in conv_model.layers:
     layer.trainable = False
 
-conv_model.add(dense_model)
+for layer in dense_model.layers:
+    layer.called_with = None
+    conv_model.add(layer)
+    conv_model.layers[-1].set_weights(layer.get_weights())
 
-print 'Training updated model'
+def train_final_model(final_model):
+    # Data augmentation
+    print('Training dense layers with data augmentation')
+    gen = image.ImageDataGenerator(
+        rotation_range=15,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        zoom_range=0.1,
+        horizontal_flip=True)
 
-conv_model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
-conv_model.fit_generator(
-    train_batches,
-    samples_per_epoch=train_batches.nb_sample,
-    nb_epoch=8,
-    validation_data=valid_batches,
-    nb_val_samples=valid_batches.nb_sample)
+    train_batches = data_provider.get_batches('train', shuffle=True, gen=gen)
+    valid_batches = data_provider.get_batches('valid', shuffle=False)
 
-exit()
+    opt = Adam(lr = 0.0001)
+    final_model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
 
-print('Saving weights...')
+    final_model.fit_generator(
+        train_batches,
+        samples_per_epoch=train_batches.nb_sample,
+        nb_epoch=4,
+        validation_data=valid_batches,
+        nb_val_samples=valid_batches.nb_sample)
 
-model.save_weights(data_provider.get_weight_filepath('finetune1.h5'))
+    opt = Adam(lr = 0.00001)
+    final_model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
 
-def get_first_dense_layer_index(model):
-    layers = model.layers
-    for i, layer in enumerate(layers):
-        if type(layer) is Dense:
-            return i
-    return None
+    final_model.fit_generator(
+        train_batches,
+        samples_per_epoch=train_batches.nb_sample,
+        nb_epoch=4,
+        validation_data=valid_batches,
+        nb_val_samples=valid_batches.nb_sample)
 
-def enable_all_dense_layers_trainable(model):
-    layers = model.layers
-    first_dense_index = get_first_dense_layer_index(model)
-    for layer in layers[first_dense_index:]:
-        layer.trainable = True
-        
-enable_all_dense_layers_trainable(model)
+    return final_model
 
-print('Training dense layers')
+def run(model, train=False):
+    if not train:
+        model.load_weights(data_provider.get_weight_filepath('final.h5'))
+    else:
+        final_model = train_final_model(model)
+        final_model.save_weights(data_provider.get_weight_filepath('final.h5'))
 
-K.set_value(opt.lr, 0.01)
-fit_model(model, train_batches, valid_batches, nb_epoch=3)
-
-print('Saving weights...')
-
-model.save_weights(data_provider.get_weight_filepath('finetune2.h5'))
+run(conv_model, train=is_training)
+final_model = conv_model
 
 def chunk(values, n):
     for i in xrange(0, len(values), n):
@@ -260,17 +326,38 @@ def limit_range(val, low, high):
         return low
     return val
 
+def model_predict(model, imgs, classes, details=False):
+    all_preds = model.predict(imgs)
+    idxs = np.argmax(all_preds, axis=1)
+    preds = [all_preds[i, idxs[i]] for i in range(len(idxs))]
+    labels = [classes[idx] for idx in idxs]
+    return np.array(preds), idxs, labels
+
+def determine_classes():
+    dp = DataProvider('../data/dogscats', 100)
+    train_batches = dp.get_batches('train', shuffle=True)
+
+    classes = list(iter(train_batches.class_indices))
+    for c in train_batches.class_indices:
+        classes[train_batches.class_indices[c]] = c
+    print classes
+    return classes
+
 def predict_dogscats(model, data_provider, batch_size):
     test_batches = data_provider.get_batches('test', batch_size=batch_size)
     filename_batches = chunk(test_batches.filenames, batch_size)
 
+    classes = determine_classes()
     with open('submission.csv', 'w') as fout:
         fout.write('id,label\n')
         for i in range(int(12500 / batch_size)):
             imgs, labels = next(test_batches)
             filenames = next(filename_batches)
             ids = [int(f[8:][:-4]) for f in filenames]
-            probabilities, categories, labels = vgg.predict(imgs, True)
+
+            # vgg.predict(imgs, True)
+            probabilities, categories, labels = model_predict(model, imgs, classes, True)
+            
             for p, c, i, l in zip(probabilities, categories, ids, labels):
                 prob_dog = None
                 if l == 'dogs':
@@ -282,8 +369,8 @@ def predict_dogscats(model, data_provider, batch_size):
                 fout.write(line)
                 print(line.strip())
 
-print('Predicting dogscats...')
-                
-batch_size = 100
-data_provider = DataProvider('../data/dogscatsredux', batch_size)
-predict_dogscats(model, data_provider, batch_size)
+if not is_training:
+    print('Predicting dogscats...')
+    batch_size = 100
+    data_provider = DataProvider('../data/dogscatsredux', batch_size)
+    predict_dogscats(final_model, data_provider, batch_size)
