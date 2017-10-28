@@ -1,5 +1,8 @@
 #!/usr/bin/env python
 
+import argparse
+import os
+
 from dataprovider import DataProvider, TrainingDataProvider
 from precompute import FeatureProvider
 from model import DogsVsCatsModelBuilder
@@ -15,11 +18,11 @@ def limit_range(val, low, high):
         return low
     return val
 
-def predict_dogscats(model, data_provider, batch_size):
+def predict_dogscats(model, data_provider, batch_size, filename):
     test_batches = data_provider.get_batches('test', batch_size=batch_size)
     filename_batches = chunk(test_batches.filenames, batch_size)
 
-    with open('submission_tmp.csv', 'w') as fout:
+    with open(filename, 'w') as fout:
         fout.write('id,label\n')
         for i in range(int(12500 / batch_size)):
             imgs, labels = next(test_batches)
@@ -37,12 +40,13 @@ def predict_dogscats(model, data_provider, batch_size):
                 fout.write(line)
                 print(line.strip())
 
-def main():
+def main(path, is_training, is_predicting, model_weights_file, submission_file):
     print('Starting train_dogscats.py')
-    is_training = False
+    print('* using path: {0}'.format(path))
+    print('* training: {0}, predicting: {1}'.format(is_training, is_predicting))
 
     batch_size = 64
-    data_provider = DataProvider('../data/dogscats', batch_size)
+    data_provider = DataProvider(os.path.join(path, 'dogcats'), batch_size)
     feature_provider = FeatureProvider(data_provider)
     training_data_provider = TrainingDataProvider(data_provider, feature_provider)
 
@@ -61,18 +65,46 @@ def main():
 
     model = builder.build(data_provider)
 
-    model_weights_file = 'final_tmp.h5'
     if not is_training:
+        print('Loading model weights from {0}'.format(model_weights_file))
         model.load_weights(data_provider.get_weight_filepath(model_weights_file))
     else:
         model.train()
+        print('Writing model weights to {0}'.format(model_weights_file))
         model.save_weights(data_provider.get_weight_filepath(model_weights_file))
 
-    if not is_training:
-        print('Predicting dogscats...')
+    if is_predicting:
+        print('Writing predictions to {0}'.format(submission_file))
         batch_size = 100
-        data_provider = DataProvider('../data/dogscatsredux', batch_size)
-        predict_dogscats(model, data_provider, batch_size)
+        data_provider = DataProvider(os.path.join(path, 'dogscatsredux'), batch_size)
+        predict_dogscats(model, data_provider, batch_size, submission_file)
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--train',
+        dest='train',
+        action='store_true',
+        help='If specified, trains the model.')
+    parser.add_argument(
+        '--predict',
+        dest='predict',
+        action='store_true',
+        help='If specified, predicts classifications.')
+    parser.add_argument(
+        '--path',
+        dest='path',
+        required=True,
+        help='The directory location containing training/validation/test data.')
+    parser.add_argument(
+        '--weightfile',
+        dest='weightfile',
+        required=True,
+        help='File to store/read model weights from.')
+    parser.add_argument(
+        '--submission',
+        dest='submission',
+        required=True,
+        help='Filename of the submission file to write predictions to.')
+    args = parser.parse_args()
+    main(args.path, args.train, args.predict, args.weightfile, args.submission)
