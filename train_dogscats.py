@@ -46,7 +46,7 @@ def main(path, is_training, is_predicting, model_weights_file, submission_file):
     print('* training: {0}, predicting: {1}'.format(is_training, is_predicting))
 
     batch_size = 64
-    data_provider = DataProvider(os.path.join(path, 'dogcats'), batch_size)
+    data_provider = DataProvider(os.path.join(path, 'dogscats'), batch_size)
     feature_provider = FeatureProvider(data_provider)
     training_data_provider = TrainingDataProvider(data_provider, feature_provider)
 
