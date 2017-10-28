@@ -1,4 +1,4 @@
-import np
+import numpy as np
 
 from vgg16 import Vgg16
 
@@ -63,10 +63,10 @@ def get_batchnorm_model(conv_model, p):
     model.add(Dense(2, activation='softmax'))
     return model
 
-class DogVsCatsModelBuilder(object):
+class DogsVsCatsModelBuilder(object):
     def __init__(self, training_data_provider, dropout=0.6, batch_size=64):
         vgg = Vgg16()
-        model = _vgg.model
+        model = vgg.model
 
         conv_model, _ = split_model(model)
         dense_model = get_batchnorm_model(conv_model, dropout)

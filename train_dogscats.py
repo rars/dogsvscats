@@ -2,6 +2,7 @@
 
 from dataprovider import DataProvider, TrainingDataProvider
 from precompute import FeatureProvider
+from model import DogsVsCatsModelBuilder
 
 def chunk(values, n):
     for i in xrange(0, len(values), n):
@@ -18,7 +19,7 @@ def predict_dogscats(model, data_provider, batch_size):
     test_batches = data_provider.get_batches('test', batch_size=batch_size)
     filename_batches = chunk(test_batches.filenames, batch_size)
 
-    with open('submission.csv', 'w') as fout:
+    with open('submission_tmp.csv', 'w') as fout:
         fout.write('id,label\n')
         for i in range(int(12500 / batch_size)):
             imgs, labels = next(test_batches)
@@ -60,7 +61,7 @@ def main():
 
     model = builder.build(data_provider)
 
-    model_weights_file = 'final.h5'
+    model_weights_file = 'final_tmp.h5'
     if not is_training:
         model.load_weights(data_provider.get_weight_filepath(model_weights_file))
     else:

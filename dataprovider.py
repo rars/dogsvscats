@@ -2,7 +2,7 @@ import os
 import bcolz
 import numpy as np
 
-from keras.processing import image
+from keras.preprocessing import image
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.utils import shuffle
 
