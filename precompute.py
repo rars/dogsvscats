@@ -10,6 +10,6 @@ class FeatureProvider(object):
       print('Getting data for {0}'.format(filename))
       data = model.predict_generator(batches, batches.nb_sample)
       print('Saving data to {0}'.format(filename))
-      data_provider.save_array(filename, data)
+      self._data_provider.save_array(filename, data)
       print('Saved data for {0}'.format(filename))
     return data
